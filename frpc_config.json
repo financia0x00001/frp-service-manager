@@ -1,0 +1,48 @@
+{
+  "server": {
+    "addr": "your-server.com",
+    "port": 7000,
+    "token": "your-secret-token",
+    "pool_count": 5
+  },
+  "proxies": [
+    {
+      "name": "ssh",
+      "type": "tcp",
+      "local_ip": "127.0.0.1",
+      "local_port": 22,
+      "remote_port": 2222
+    },
+    {
+      "name": "web",
+      "type": "tcp",
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "remote_port": 8080
+    },
+    {
+      "name": "dns",
+      "type": "udp",
+      "local_ip": "127.0.0.1",
+      "local_port": 53,
+      "remote_port": 5353
+    },
+    {
+      "name": "rdp_p2p",
+      "type": "xtcp",
+      "local_ip": "127.0.0.1",
+      "local_port": 3389,
+      "secret_key": "shared_secret_123"
+    }
+  ],
+  "visitors": [
+    {
+      "name": "rdp_p2p_visitor",
+      "type": "xtcp",
+      "server_name": "rdp_p2p",
+      "secret_key": "shared_secret_123",
+      "bind_port": 13389,
+      "local_ip": "0.0.0.0"
+    }
+  ]
+}
