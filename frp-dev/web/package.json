@@ -1,5 +1,0 @@
-{
-  "name": "frp-web",
-  "private": true,
-  "workspaces": ["shared", "frpc", "frps"]
-}
