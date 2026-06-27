@@ -20,6 +20,8 @@ import queue
 import sys
 import threading
 import time
+import ctypes
+import struct
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from typing import List, Dict, Optional
@@ -87,7 +89,7 @@ class ProxyEditDialog(tk.Toplevel):
         self.vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Widget] = {}
 
-        self.geometry("380x380")
+        self.geometry("380x460")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -125,16 +127,253 @@ class ProxyEditDialog(tk.Toplevel):
         self.destroy()
 
 
+# ==================== Windows 系统托盘支持（纯 ctypes 实现） ====================
+
+_WM_TRAYICON = 0x0400 + 21
+_WM_TASK = 0x0400 + 22
+_TASK_SHOW = 1
+_TASK_HIDE = 2
+_TASK_DESTROY = 3
+_NIM_ADD = 0x00000000
+_NIM_DELETE = 0x00000002
+_NIF_MESSAGE = 0x00000001
+_NIF_ICON = 0x00000002
+_NIF_TIP = 0x00000004
+_WM_LBUTTONUP = 0x0202
+_WM_RBUTTONUP = 0x0205
+_WM_DESTROY = 0x0002
+_IDI_APPLICATION = 32512
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+    ]
+
+
+class _WNDCLASS(ctypes.Structure):
+    _fields_ = [
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+    ]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint),
+        ("pt", ctypes.c_long * 2),
+    ]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+    ctypes.c_size_t, ctypes.c_ssize_t
+)
+
+
+def _setup_user32_argtypes():
+    """为 user32 / shell32 函数设置正确的参数类型（64-bit 兼容）"""
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    HWND = ctypes.c_void_p
+    UINT = ctypes.c_uint
+    WPARAM = ctypes.c_size_t
+    LPARAM = ctypes.c_ssize_t
+    LRESULT = ctypes.c_ssize_t
+    BOOL = ctypes.c_int
+
+    user32.DefWindowProcW.argtypes = [HWND, UINT, WPARAM, LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        HWND, HWND, HWND, ctypes.c_void_p
+    ]
+    user32.CreateWindowExW.restype = HWND
+
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassW.restype = ctypes.c_ushort
+
+    user32.GetMessageW.argtypes = [ctypes.c_void_p, HWND, UINT, UINT]
+    user32.GetMessageW.restype = BOOL
+
+    user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+    user32.TranslateMessage.restype = BOOL
+
+    user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+    user32.DispatchMessageW.restype = LRESULT
+
+    user32.PostMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
+    user32.PostMessageW.restype = BOOL
+
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.PostQuitMessage.restype = None
+
+    user32.DestroyWindow.argtypes = [HWND]
+    user32.DestroyWindow.restype = BOOL
+
+    user32.LoadIconW.argtypes = [HWND, ctypes.c_void_p]
+    user32.LoadIconW.restype = HWND
+
+    user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+    user32.GetCursorPos.restype = BOOL
+
+    shell32.Shell_NotifyIconW.argtypes = [UINT, ctypes.c_void_p]
+    shell32.Shell_NotifyIconW.restype = BOOL
+
+
+_setup_user32_argtypes()
+
+
+class SystemTray(threading.Thread):
+    """Windows 系统托盘图标（独立线程消息循环，纯 ctypes 实现，无外部依赖）"""
+
+    def __init__(self, root, on_show, on_exit):
+        super().__init__(daemon=True)
+        self.root = root
+        self.on_show = on_show
+        self.on_exit = on_exit
+        self._hwnd = None
+        self._hicon = None
+        self._visible = False
+        self._ready = threading.Event()
+        self._wndproc_cb = None  # 防止回调被垃圾回收
+
+    def run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # 注册窗口类
+        self._wndproc_cb = _WNDPROC(self._tray_wndproc)
+        hinstance = kernel32.GetModuleHandleW(None)
+        cls = _WNDCLASS()
+        cls.lpfnWndProc = ctypes.cast(self._wndproc_cb, ctypes.c_void_p)
+        cls.hInstance = hinstance
+        cls.lpszClassName = "FrpcTrayWndClass"
+        user32.RegisterClassW(ctypes.byref(cls))
+
+        # 创建隐藏窗口
+        self._hwnd = user32.CreateWindowExW(
+            0, "FrpcTrayWndClass", "", 0, 0, 0, 0, 0, None, None, hinstance, None
+        )
+
+        # 加载图标
+        self._hicon = user32.LoadIconW(0, _IDI_APPLICATION)
+
+        self._ready.set()
+
+        # 消息循环
+        msg = _MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _tray_wndproc(self, hwnd, msg, wparam, lparam):
+        user32 = ctypes.windll.user32
+
+        if msg == _WM_TRAYICON:
+            if lparam == _WM_LBUTTONUP:
+                self.root.after(0, self.on_show)
+            elif lparam == _WM_RBUTTONUP:
+                self.root.after(0, self._show_context_menu)
+            return 0
+        elif msg == _WM_TASK:
+            if wparam == _TASK_SHOW:
+                self._add_icon()
+            elif wparam == _TASK_HIDE:
+                self._remove_icon()
+            elif wparam == _TASK_DESTROY:
+                self._remove_icon()
+                user32.DestroyWindow(hwnd)
+            return 0
+        elif msg == _WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _add_icon(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        nid.uFlags = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_TRAYICON
+        nid.hIcon = self._hicon
+        nid.szTip = "frp-lite 客户端"
+        ctypes.windll.shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid))
+        self._visible = True
+
+    def _remove_icon(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        ctypes.windll.shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+        self._visible = False
+
+    def _show_context_menu(self):
+        """右键托盘图标弹出 tkinter 菜单"""
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="显示主窗口", command=self.on_show)
+        menu.add_separator()
+        menu.add_command(label="退出", command=self.on_exit)
+        menu.tk_popup(pt.x, pt.y)
+
+    def show(self):
+        """显示托盘图标（线程安全）"""
+        self._ready.wait(timeout=5)
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, _WM_TASK, _TASK_SHOW, 0)
+
+    def hide(self):
+        """隐藏托盘图标（线程安全）"""
+        self._ready.wait(timeout=5)
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, _WM_TASK, _TASK_HIDE, 0)
+
+    def destroy(self):
+        """销毁托盘图标和窗口（线程安全）"""
+        self._ready.wait(timeout=5)
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, _WM_TASK, _TASK_DESTROY, 0)
+
+
 class ClientGUI:
     """frpc 客户端主窗口"""
 
     PROXY_FIELDS = [
         {"key": "name", "label": "代理名称", "default": ""},
         {"key": "type", "label": "代理类型", "default": "tcp",
-         "type": "combo", "values": ["tcp", "udp", "xtcp"]},
+         "type": "combo", "values": ["tcp", "udp", "xtcp", "http", "https"]},
         {"key": "local_ip", "label": "本地地址", "default": "127.0.0.1"},
         {"key": "local_port", "label": "本地端口", "default": ""},
         {"key": "remote_port", "label": "远程端口", "default": ""},
+        {"key": "custom_domains", "label": "自定义域名(HTTP/HTTPS)", "default": ""},
+        {"key": "subdomain", "label": "子域名前缀(HTTP/HTTPS)", "default": ""},
+        {"key": "http_user", "label": "HTTP用户名(可选)", "default": ""},
+        {"key": "http_pwd", "label": "HTTP密码(可选)", "default": ""},
         {"key": "secret_key", "label": "密钥(XTCP)", "default": ""},
     ]
 
@@ -167,6 +406,9 @@ class ClientGUI:
 
         self._setup_logging()
         self._build_ui()
+        self.root.update_idletasks()
+        self._tray = SystemTray(root, self._restore_from_tray, self._exit_app)
+        self._tray.start()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_logging(self):
@@ -338,14 +580,26 @@ class ClientGUI:
     def _add_proxy(self):
         dlg = ProxyEditDialog(self.root, "添加代理", self.PROXY_FIELDS)
         if dlg.result:
+            # 解析 custom_domains（逗号分隔）
+            custom_domains_str = dlg.result.get("custom_domains", "")
+            custom_domains = [d.strip() for d in custom_domains_str.split(",") if d.strip()] if custom_domains_str else []
+
             cfg = {
                 "name": dlg.result["name"],
                 "type": dlg.result["type"],
                 "local_ip": dlg.result["local_ip"],
-                "local_port": int(dlg.result["local_port"]),
-                "remote_port": int(dlg.result["remote_port"]),
+                "local_port": int(dlg.result["local_port"]) if dlg.result["local_port"] else 0,
+                "remote_port": int(dlg.result["remote_port"]) if dlg.result["remote_port"] else 0,
                 "secret_key": dlg.result.get("secret_key", ""),
             }
+            # HTTP/HTTPS 代理额外字段
+            if dlg.result["type"] in ("http", "https"):
+                cfg["custom_domains"] = custom_domains
+                cfg["subdomain"] = dlg.result.get("subdomain", "")
+                cfg["http_user"] = dlg.result.get("http_user", "")
+                cfg["http_pwd"] = dlg.result.get("http_pwd", "")
+                cfg["host_header_rewrite"] = ""
+
             self._proxies.append(cfg)
             self._refresh_proxy_tree()
             self._log_message(f"添加代理: {cfg['name']} ({cfg['type']})", "INFO")
@@ -357,17 +611,33 @@ class ClientGUI:
             return
         idx = self.proxy_tree.index(sel[0])
         old_cfg = self._proxies[idx]
-        initial = {k: str(v) for k, v in old_cfg.items()}
+        # 将 custom_domains 列表转为逗号分隔字符串用于编辑
+        initial = {}
+        for k, v in old_cfg.items():
+            if k == "custom_domains" and isinstance(v, list):
+                initial[k] = ", ".join(v)
+            else:
+                initial[k] = str(v)
         dlg = ProxyEditDialog(self.root, "编辑代理", self.PROXY_FIELDS, initial)
         if dlg.result:
+            custom_domains_str = dlg.result.get("custom_domains", "")
+            custom_domains = [d.strip() for d in custom_domains_str.split(",") if d.strip()] if custom_domains_str else []
+
             new_cfg = {
                 "name": dlg.result["name"],
                 "type": dlg.result["type"],
                 "local_ip": dlg.result["local_ip"],
-                "local_port": int(dlg.result["local_port"]),
-                "remote_port": int(dlg.result["remote_port"]),
+                "local_port": int(dlg.result["local_port"]) if dlg.result["local_port"] else 0,
+                "remote_port": int(dlg.result["remote_port"]) if dlg.result["remote_port"] else 0,
                 "secret_key": dlg.result.get("secret_key", ""),
             }
+            if dlg.result["type"] in ("http", "https"):
+                new_cfg["custom_domains"] = custom_domains
+                new_cfg["subdomain"] = dlg.result.get("subdomain", "")
+                new_cfg["http_user"] = dlg.result.get("http_user", "")
+                new_cfg["http_pwd"] = dlg.result.get("http_pwd", "")
+                new_cfg["host_header_rewrite"] = ""
+
             self._proxies[idx] = new_cfg
             self._refresh_proxy_tree()
             self._log_message(f"更新代理: {new_cfg['name']}", "INFO")
@@ -388,8 +658,14 @@ class ClientGUI:
             self.proxy_tree.delete(item)
         for p in self._proxies:
             local = f"{p['local_ip']}:{p['local_port']}"
+            ptype = p["type"]
+            if ptype in ("http", "https"):
+                domains = p.get("custom_domains", [])
+                remote = ", ".join(domains) if domains else p.get("subdomain", "")
+            else:
+                remote = str(p.get("remote_port", ""))
             self.proxy_tree.insert("", tk.END,
-                                    values=(p["name"], p["type"], local, p["remote_port"]))
+                                    values=(p["name"], ptype, local, remote))
         self.proxies_count_var.set(str(len(self._proxies)))
 
     # ==================== 访问者编辑 ====================
@@ -623,11 +899,62 @@ class ClientGUI:
         except Exception as e:
             self._log_message(f"导入配置失败: {e}", "ERROR")
 
-    # ==================== 退出 ====================
+    # ==================== 关闭与托盘 ====================
 
     def _on_close(self):
+        """点击关闭按钮时弹出选择对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("关闭确认")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg="#f0f0f0")
+
+        # 居中显示
+        dialog.update_idletasks()
+        dw, dh = 320, 160
+        x = self.root.winfo_x() + (self.root.winfo_width() - dw) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+
+        tk.Label(dialog, text="请选择关闭方式：",
+                 font=("Microsoft YaHei", 11), bg="#f0f0f0").pack(pady=(25, 20))
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack()
+
+        def minimize():
+            dialog.destroy()
+            self._minimize_to_tray()
+
+        def exit_app():
+            dialog.destroy()
+            self._exit_app()
+
+        ttk.Button(btn_frame, text="最小化到托盘",
+                   command=minimize, width=14).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="直接退出",
+                   command=exit_app, width=14).pack(side=tk.LEFT, padx=10)
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+    def _minimize_to_tray(self):
+        """最小化到系统托盘"""
+        self._tray.show()
+        self.root.withdraw()
+        self._log_message("已最小化到系统托盘", "INFO")
+
+    def _restore_from_tray(self):
+        """从系统托盘恢复窗口"""
+        self._tray.hide()
+        self.root.deiconify()
+        self.root.state("normal")
+
+    def _exit_app(self):
+        """退出应用"""
         if self._connected:
             self._disconnect()
+        self._tray.destroy()
         self.engine.stop()
         self.root.destroy()
 

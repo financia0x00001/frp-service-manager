@@ -163,9 +163,36 @@ class ServerGUI:
         ttk.Entry(token_frame, textvariable=self.token_var, width=15).pack(side=tk.LEFT)
         ttk.Button(token_frame, text="随机生成", command=self._gen_token, width=9).pack(side=tk.LEFT, padx=4)
 
+        # vhost 配置
+        ttk.Label(cfg_frame, text="HTTP端口:").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.vhost_http_port_var = tk.StringVar(value="0")
+        ttk.Entry(cfg_frame, textvariable=self.vhost_http_port_var, width=22).grid(row=3, column=1, padx=5, pady=3)
+
+        ttk.Label(cfg_frame, text="HTTPS端口:").grid(row=4, column=0, sticky=tk.W, pady=3)
+        self.vhost_https_port_var = tk.StringVar(value="0")
+        ttk.Entry(cfg_frame, textvariable=self.vhost_https_port_var, width=22).grid(row=4, column=1, padx=5, pady=3)
+
+        ttk.Label(cfg_frame, text="证书文件:").grid(row=5, column=0, sticky=tk.W, pady=3)
+        self.cert_file_var = tk.StringVar(value="")
+        cert_frame = ttk.Frame(cfg_frame)
+        cert_frame.grid(row=5, column=1, padx=5, pady=3, sticky=tk.W)
+        ttk.Entry(cert_frame, textvariable=self.cert_file_var, width=15).pack(side=tk.LEFT)
+        ttk.Button(cert_frame, text="浏览", command=self._browse_cert, width=5).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(cfg_frame, text="私钥文件:").grid(row=6, column=0, sticky=tk.W, pady=3)
+        self.key_file_var = tk.StringVar(value="")
+        key_frame = ttk.Frame(cfg_frame)
+        key_frame.grid(row=6, column=1, padx=5, pady=3, sticky=tk.W)
+        ttk.Entry(key_frame, textvariable=self.key_file_var, width=15).pack(side=tk.LEFT)
+        ttk.Button(key_frame, text="浏览", command=self._browse_key, width=5).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(cfg_frame, text="子域名根:").grid(row=7, column=0, sticky=tk.W, pady=3)
+        self.subdomain_host_var = tk.StringVar(value="")
+        ttk.Entry(cfg_frame, textvariable=self.subdomain_host_var, width=22).grid(row=7, column=1, padx=5, pady=3)
+
         # 控制按钮
         btn_frame = ttk.Frame(cfg_frame)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=(10, 0))
+        btn_frame.grid(row=8, column=0, columnspan=2, pady=(10, 0))
 
         self.start_btn = ttk.Button(btn_frame, text="▶ 启动服务", command=self._start_server, width=14)
         self.start_btn.pack(side=tk.LEFT, padx=3)
@@ -258,11 +285,28 @@ class ServerGUI:
     def _gen_token(self):
         self.token_var.set(generate_token(12))
 
+    def _browse_cert(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(filetypes=[("PEM/CRT files", "*.pem *.crt *.cer"), ("All files", "*.*")])
+        if path:
+            self.cert_file_var.set(path)
+
+    def _browse_key(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(filetypes=[("PEM/KEY files", "*.pem *.key"), ("All files", "*.*")])
+        if path:
+            self.key_file_var.set(path)
+
     def _save_config(self):
         config = {
             "bind_addr": self.bind_addr_var.get(),
             "bind_port": int(self.bind_port_var.get()),
             "token": self.token_var.get(),
+            "vhost_http_port": int(self.vhost_http_port_var.get() or "0"),
+            "vhost_https_port": int(self.vhost_https_port_var.get() or "0"),
+            "cert_file": self.cert_file_var.get(),
+            "key_file": self.key_file_var.get(),
+            "subdomain_host": self.subdomain_host_var.get(),
         }
         try:
             from tkinter import filedialog
@@ -288,6 +332,11 @@ class ServerGUI:
                 self.bind_addr_var.set(config.get("bind_addr", "0.0.0.0"))
                 self.bind_port_var.set(str(config.get("bind_port", 7000)))
                 self.token_var.set(config.get("token", ""))
+                self.vhost_http_port_var.set(str(config.get("vhost_http_port", 0)))
+                self.vhost_https_port_var.set(str(config.get("vhost_https_port", 0)))
+                self.cert_file_var.set(config.get("cert_file", ""))
+                self.key_file_var.set(config.get("key_file", ""))
+                self.subdomain_host_var.set(config.get("subdomain_host", ""))
                 self._log_message(f"配置已加载: {path}", "INFO")
         except Exception as e:
             self._log_message(f"加载配置失败: {e}", "ERROR")
@@ -304,13 +353,31 @@ class ServerGUI:
             messagebox.showerror("错误", "端口号必须为数字")
             return
         token = self.token_var.get().strip()
+        try:
+            vhost_http_port = int(self.vhost_http_port_var.get() or "0")
+        except ValueError:
+            vhost_http_port = 0
+        try:
+            vhost_https_port = int(self.vhost_https_port_var.get() or "0")
+        except ValueError:
+            vhost_https_port = 0
+        cert_file = self.cert_file_var.get().strip()
+        key_file = self.key_file_var.get().strip()
+        subdomain_host = self.subdomain_host_var.get().strip()
 
         if not token:
             messagebox.showerror("错误", "Token 不能为空")
             return
 
         def _do_start():
-            self.engine.server = FrpServer(bind_addr, bind_port, token)
+            self.engine.server = FrpServer(
+                bind_addr, bind_port, token,
+                vhost_http_port=vhost_http_port,
+                vhost_https_port=vhost_https_port,
+                cert_file=cert_file,
+                key_file=key_file,
+                subdomain_host=subdomain_host,
+            )
             try:
                 future = self.engine.submit(self.engine.server.start())
                 future.add_done_callback(self._on_server_started)
@@ -437,6 +504,10 @@ class ServerGUI:
                 ptype = info.get("type", "?")
                 port = str(info.get("remote_port", "-"))
                 run_id = info.get("run_id", "?")[:12]
+                # HTTP/HTTPS 代理显示域名
+                if ptype in ("http", "https"):
+                    domains = info.get("custom_domains", [])
+                    port = ", ".join(domains) if domains else info.get("subdomain", "-")
                 vals = (name, ptype, port, run_id)
                 if name in proxy_existing:
                     self.proxy_tree.item(proxy_existing[name], values=vals)

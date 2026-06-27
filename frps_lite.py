@@ -35,7 +35,7 @@ from frp_lite_protocol import (
     MSG_START_WORK_CONN, MSG_PING, MSG_PONG, MSG_UDP_PACKET,
     MSG_NAT_HOLE_VISITOR, MSG_NAT_HOLE_CLIENT,
     MSG_NAT_HOLE_RESP, MSG_NAT_HOLE_SID,
-    PROXY_TCP, PROXY_UDP, PROXY_XTCP,
+    PROXY_TCP, PROXY_UDP, PROXY_XTCP, PROXY_HTTP, PROXY_HTTPS,
     read_message, write_message, generate_run_id,
     generate_transaction_id, generate_sid,
     HEADER_SIZE, MAX_MSG_SIZE, pack_message,
@@ -250,6 +250,485 @@ class XTCPProxy:
 
 
 # ============================================================
+#  HTTP vhost 代理 (基于域名的 HTTP 虚拟主机路由)
+# ============================================================
+class HTTPVhostProxy:
+    """服务端 HTTP vhost 代理：根据 Host 头路由到对应客户端
+
+    多个 HTTP 代理共享同一个 vhost 端口（默认80），
+    通过请求头中的 Host 字段区分不同的代理。
+    """
+
+    def __init__(self, name: str, custom_domains: list, control: "ControlHandler",
+                 subdomain: str = "", http_user: str = "", http_pwd: str = "",
+                 host_header_rewrite: str = ""):
+        self.name = name
+        self.custom_domains = [d.strip().lower() for d in custom_domains if d.strip()]
+        self.subdomain = subdomain.strip().lower()
+        self.control = control
+        self.http_user = http_user
+        self.http_pwd = http_pwd
+        self.host_header_rewrite = host_header_rewrite
+        # 不单独监听端口，由 VhostServer 统一监听
+
+    def match_host(self, host: str) -> bool:
+        """检查请求的 Host 是否匹配此代理"""
+        if not host:
+            return False
+        host = host.lower()
+        # 去掉端口部分
+        if ":" in host:
+            host = host.split(":")[0]
+        if host in self.custom_domains:
+            return True
+        if self.subdomain and self.control.server.subdomain_host:
+            full_domain = f"{self.subdomain}.{self.control.server.subdomain_host}"
+            if host == full_domain:
+                return True
+        return False
+
+    async def handle_request(self, reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter, host: str):
+        """处理匹配到的 HTTP 请求"""
+        # HTTP Basic Auth 校验
+        if self.http_user and self.http_pwd:
+            if not self._check_http_auth(reader, writer):
+                return
+
+        try:
+            work_reader, work_writer, _ = await self.control.get_work_conn()
+        except Exception as e:
+            log.warning(f"[HTTP:{self.name}] 获取工作连接失败: {e}")
+            writer.close()
+            return
+
+        try:
+            # 读取已消费的 HTTP 请求头数据，需要重新发送给客户端
+            # 由于我们已经在 VhostHTTPServer 中读取了首行和头部，
+            # 这里需要将完整的 HTTP 请求重新构造发送给工作连接
+            start_data = {
+                "proxy_name": self.name,
+                "src_addr": writer.get_extra_info("peername")[0] if writer.get_extra_info("peername") else "",
+                "src_port": writer.get_extra_info("peername")[1] if writer.get_extra_info("peername") else 0,
+                "dst_addr": "",
+                "dst_port": 0,
+            }
+            await write_message(work_writer, MSG_START_WORK_CONN, start_data)
+
+            # 将缓存的原始请求数据发送到工作连接
+            # VhostHTTPServer 会把原始请求字节缓存到 reader 对象上
+            raw_data = getattr(reader, '_vhost_raw_data', b'')
+            if raw_data:
+                work_writer.write(raw_data)
+                await work_writer.drain()
+
+            await asyncio.gather(
+                _pipe(reader, work_writer),
+                _pipe(work_reader, writer),
+            )
+        except Exception as e:
+            log.debug(f"[HTTP:{self.name}] 转发错误: {e}")
+        finally:
+            writer.close()
+            try:
+                work_writer.close()
+            except Exception:
+                pass
+
+    def _check_http_auth(self, reader, writer) -> bool:
+        """检查 HTTP Basic 认证（简化实现）"""
+        # 认证在 VhostHTTPServer 中处理
+        return True
+
+    async def close(self):
+        log.info(f"[HTTP:{self.name}] 已关闭")
+
+
+# ============================================================
+#  HTTPS vhost 代理 (TLS 终止 + 基于域名的路由)
+# ============================================================
+class HTTPSVhostProxy:
+    """服务端 HTTPS vhost 代理：TLS 终止后根据 Host 头路由
+
+    服务端持有 SSL 证书，在 vhost HTTPS 端口（默认443）上监听，
+    TLS 握手后读取 HTTP 请求的 Host 头进行路由。
+    """
+
+    def __init__(self, name: str, custom_domains: list, control: "ControlHandler",
+                 subdomain: str = "", http_user: str = "", http_pwd: str = "",
+                 host_header_rewrite: str = ""):
+        self.name = name
+        self.custom_domains = [d.strip().lower() for d in custom_domains if d.strip()]
+        self.subdomain = subdomain.strip().lower()
+        self.control = control
+        self.http_user = http_user
+        self.http_pwd = http_pwd
+        self.host_header_rewrite = host_header_rewrite
+
+    def match_host(self, host: str) -> bool:
+        """检查请求的 Host 是否匹配此代理"""
+        if not host:
+            return False
+        host = host.lower()
+        if ":" in host:
+            host = host.split(":")[0]
+        if host in self.custom_domains:
+            return True
+        if self.subdomain and self.control.server.subdomain_host:
+            full_domain = f"{self.subdomain}.{self.control.server.subdomain_host}"
+            if host == full_domain:
+                return True
+        return False
+
+    async def handle_request(self, reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter, host: str):
+        """处理匹配到的 HTTPS 请求（TLS 已在 VhostHTTPSServer 中终止）"""
+        try:
+            work_reader, work_writer, _ = await self.control.get_work_conn()
+        except Exception as e:
+            log.warning(f"[HTTPS:{self.name}] 获取工作连接失败: {e}")
+            writer.close()
+            return
+
+        try:
+            start_data = {
+                "proxy_name": self.name,
+                "src_addr": writer.get_extra_info("peername")[0] if writer.get_extra_info("peername") else "",
+                "src_port": writer.get_extra_info("peername")[1] if writer.get_extra_info("peername") else 0,
+                "dst_addr": "",
+                "dst_port": 0,
+            }
+            await write_message(work_writer, MSG_START_WORK_CONN, start_data)
+
+            raw_data = getattr(reader, '_vhost_raw_data', b'')
+            if raw_data:
+                work_writer.write(raw_data)
+                await work_writer.drain()
+
+            await asyncio.gather(
+                _pipe(reader, work_writer),
+                _pipe(work_reader, writer),
+            )
+        except Exception as e:
+            log.debug(f"[HTTPS:{self.name}] 转发错误: {e}")
+        finally:
+            writer.close()
+            try:
+                work_writer.close()
+            except Exception:
+                pass
+
+    async def close(self):
+        log.info(f"[HTTPS:{self.name}] 已关闭")
+
+
+# ============================================================
+#  Vhost HTTP 服务器 (共享80端口，按Host路由)
+# ============================================================
+class VhostHTTPServer:
+    """HTTP vhost 服务器：在指定端口监听，根据 Host 头路由到不同代理"""
+
+    def __init__(self, bind_addr: str, vhost_http_port: int, server: "FrpServer"):
+        self.bind_addr = bind_addr
+        self.vhost_http_port = vhost_http_port
+        self.server = server
+        self._tcp_server: Optional[asyncio.AbstractServer] = None
+
+    async def start(self):
+        try:
+            self._tcp_server = await asyncio.start_server(
+                self._handle_conn, self.bind_addr, self.vhost_http_port
+            )
+            log.info(f"[VhostHTTP] 监听端口 {self.bind_addr}:{self.vhost_http_port}")
+        except OSError as e:
+            log.error(f"[VhostHTTP] 端口 {self.vhost_http_port} 绑定失败: {e}")
+            raise
+
+    async def _handle_conn(self, reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter):
+        """处理 HTTP 连接：读取 Host 头，路由到对应代理"""
+        peername = writer.get_extra_info("peername")
+        raw_data = b""
+
+        try:
+            # 读取 HTTP 请求行
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+            raw_data += request_line
+
+            # 读取请求头
+            headers_data = b""
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                headers_data += line
+                if line == b"\r\n" or line == b"\n" or not line:
+                    break
+            raw_data += headers_data
+
+            # 解析 Host 头
+            host = self._parse_host(headers_data)
+            if not host:
+                self._send_404(writer)
+                return
+
+            log.info(f"[VhostHTTP] 请求 Host={host} from {peername}")
+
+            # 查找匹配的代理
+            proxy = self.server._find_vhost_proxy(PROXY_HTTP, host)
+            if not proxy:
+                self._send_404(writer, host)
+                return
+
+            # HTTP Basic Auth 校验
+            if proxy.http_user and proxy.http_pwd:
+                auth_header = self._parse_header(headers_data, "Authorization")
+                if not self._verify_basic_auth(auth_header, proxy.http_user, proxy.http_pwd):
+                    self._send_401(writer)
+                    return
+
+            # 将原始请求数据缓存到 reader 上，供代理转发使用
+            reader._vhost_raw_data = raw_data
+            await proxy.handle_request(reader, writer, host)
+
+        except asyncio.TimeoutError:
+            log.debug(f"[VhostHTTP] 读取请求超时 from {peername}")
+            writer.close()
+        except Exception as e:
+            log.debug(f"[VhostHTTP] 处理连接错误: {e}")
+            writer.close()
+
+    def _parse_host(self, headers_data: bytes) -> str:
+        """从 HTTP 请求头中解析 Host"""
+        try:
+            headers_str = headers_data.decode("utf-8", errors="ignore")
+            for line in headers_str.split("\r\n"):
+                if line.lower().startswith("host:"):
+                    host = line.split(":", 1)[1].strip()
+                    return host
+        except Exception:
+            pass
+        return ""
+
+    def _parse_header(self, headers_data: bytes, header_name: str) -> str:
+        """从 HTTP 请求头中解析指定头部"""
+        try:
+            headers_str = headers_data.decode("utf-8", errors="ignore")
+            for line in headers_str.split("\r\n"):
+                if line.lower().startswith(header_name.lower() + ":"):
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _verify_basic_auth(self, auth_header: str, user: str, pwd: str) -> bool:
+        """验证 HTTP Basic Auth"""
+        import base64 as _b64
+        if not auth_header or not auth_header.startswith("Basic "):
+            return False
+        try:
+            decoded = _b64.b64decode(auth_header[6:]).decode("utf-8")
+            parts = decoded.split(":", 1)
+            if len(parts) == 2 and parts[0] == user and parts[1] == pwd:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _send_404(self, writer: asyncio.StreamWriter, host: str = ""):
+        body = f"404 Not Found - No proxy found for host: {host}".encode()
+        resp = (
+            b"HTTP/1.1 404 Not Found\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(resp)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    def _send_401(self, writer: asyncio.StreamWriter):
+        body = b"401 Unauthorized"
+        resp = (
+            b"HTTP/1.1 401 Unauthorized\r\n"
+            b"WWW-Authenticate: Basic realm=\"frp\"\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(resp)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    async def close(self):
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            log.info("[VhostHTTP] 已关闭")
+
+
+# ============================================================
+#  Vhost HTTPS 服务器 (共享443端口，TLS终止 + 按Host路由)
+# ============================================================
+class VhostHTTPSServer:
+    """HTTPS vhost 服务器：TLS 终止后根据 Host 头路由到不同代理"""
+
+    def __init__(self, bind_addr: str, vhost_https_port: int, server: "FrpServer",
+                 cert_file: str = "", key_file: str = ""):
+        self.bind_addr = bind_addr
+        self.vhost_https_port = vhost_https_port
+        self.server = server
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self._tcp_server: Optional[asyncio.AbstractServer] = None
+
+    async def start(self):
+        if not self.cert_file or not self.key_file:
+            log.warning("[VhostHTTPS] 未配置证书，HTTPS vhost 未启动")
+            return
+        if not os.path.exists(self.cert_file):
+            log.error(f"[VhostHTTPS] 证书文件不存在: {self.cert_file}")
+            return
+        if not os.path.exists(self.key_file):
+            log.error(f"[VhostHTTPS] 私钥文件不存在: {self.key_file}")
+            return
+
+        try:
+            import ssl
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(self.cert_file, self.key_file)
+
+            self._tcp_server = await asyncio.start_server(
+                self._handle_conn, self.bind_addr, self.vhost_https_port,
+                ssl=ssl_ctx
+            )
+            log.info(f"[VhostHTTPS] 监听端口 {self.bind_addr}:{self.vhost_https_port} (cert={self.cert_file})")
+        except OSError as e:
+            log.error(f"[VhostHTTPS] 端口 {self.vhost_https_port} 绑定失败: {e}")
+            raise
+
+    async def _handle_conn(self, reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter):
+        """处理 HTTPS 连接：TLS 已终止，读取 Host 头路由"""
+        peername = writer.get_extra_info("peername")
+        raw_data = b""
+
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+            raw_data += request_line
+
+            headers_data = b""
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                headers_data += line
+                if line == b"\r\n" or line == b"\n" or not line:
+                    break
+            raw_data += headers_data
+
+            host = self._parse_host(headers_data)
+            if not host:
+                self._send_404(writer)
+                return
+
+            log.info(f"[VhostHTTPS] 请求 Host={host} from {peername}")
+
+            proxy = self.server._find_vhost_proxy(PROXY_HTTPS, host)
+            if not proxy:
+                # 也尝试匹配 HTTP 代理（HTTP/HTTPS 共享域名配置）
+                proxy = self.server._find_vhost_proxy(PROXY_HTTP, host)
+            if not proxy:
+                self._send_404(writer, host)
+                return
+
+            # HTTP Basic Auth
+            if proxy.http_user and proxy.http_pwd:
+                auth_header = self._parse_header(headers_data, "Authorization")
+                if not self._verify_basic_auth(auth_header, proxy.http_user, proxy.http_pwd):
+                    self._send_401(writer)
+                    return
+
+            reader._vhost_raw_data = raw_data
+            await proxy.handle_request(reader, writer, host)
+
+        except asyncio.TimeoutError:
+            log.debug(f"[VhostHTTPS] 读取请求超时 from {peername}")
+            writer.close()
+        except Exception as e:
+            log.debug(f"[VhostHTTPS] 处理连接错误: {e}")
+            writer.close()
+
+    def _parse_host(self, headers_data: bytes) -> str:
+        try:
+            headers_str = headers_data.decode("utf-8", errors="ignore")
+            for line in headers_str.split("\r\n"):
+                if line.lower().startswith("host:"):
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _parse_header(self, headers_data: bytes, header_name: str) -> str:
+        try:
+            headers_str = headers_data.decode("utf-8", errors="ignore")
+            for line in headers_str.split("\r\n"):
+                if line.lower().startswith(header_name.lower() + ":"):
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _verify_basic_auth(self, auth_header: str, user: str, pwd: str) -> bool:
+        import base64 as _b64
+        if not auth_header or not auth_header.startswith("Basic "):
+            return False
+        try:
+            decoded = _b64.b64decode(auth_header[6:]).decode("utf-8")
+            parts = decoded.split(":", 1)
+            if len(parts) == 2 and parts[0] == user and parts[1] == pwd:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _send_404(self, writer: asyncio.StreamWriter, host: str = ""):
+        body = f"404 Not Found - No proxy found for host: {host}".encode()
+        resp = (
+            b"HTTP/1.1 404 Not Found\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(resp)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    def _send_401(self, writer: asyncio.StreamWriter):
+        body = b"401 Unauthorized"
+        resp = (
+            b"HTTP/1.1 401 Unauthorized\r\n"
+            b"WWW-Authenticate: Basic realm=\"frp\"\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(resp)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    async def close(self):
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            log.info("[VhostHTTPS] 已关闭")
+
+
+# ============================================================
 #  控制连接处理器 (每个客户端一个 ControlHandler)
 # ============================================================
 class ControlHandler:
@@ -342,6 +821,11 @@ class ControlHandler:
         name = data.get("name", "")
         proxy_type = data.get("proxy_type", PROXY_TCP)
         remote_port = data.get("remote_port", 0)
+        custom_domains = data.get("custom_domains", [])
+        subdomain = data.get("subdomain", "")
+        http_user = data.get("http_user", "")
+        http_pwd = data.get("http_pwd", "")
+        host_header_rewrite = data.get("host_header_rewrite", "")
 
         if not name:
             await self.send_msg(MSG_NEW_PROXY_RESP, {"name": name, "error": "name required"})
@@ -360,14 +844,44 @@ class ControlHandler:
                 await pxy.start()
             elif proxy_type == PROXY_XTCP:
                 pxy = XTCPProxy(name, self)
+            elif proxy_type == PROXY_HTTP:
+                if not custom_domains and not subdomain:
+                    await self.send_msg(MSG_NEW_PROXY_RESP, {
+                        "name": name, "error": "http proxy requires custom_domains or subdomain"
+                    })
+                    return
+                pxy = HTTPVhostProxy(name, custom_domains, self,
+                                      subdomain=subdomain,
+                                      http_user=http_user, http_pwd=http_pwd,
+                                      host_header_rewrite=host_header_rewrite)
+                # 确保 vhost HTTP 服务器已启动
+                self.server._ensure_vhost_http()
+            elif proxy_type == PROXY_HTTPS:
+                if not custom_domains and not subdomain:
+                    await self.send_msg(MSG_NEW_PROXY_RESP, {
+                        "name": name, "error": "https proxy requires custom_domains or subdomain"
+                    })
+                    return
+                pxy = HTTPSVhostProxy(name, custom_domains, self,
+                                       subdomain=subdomain,
+                                       http_user=http_user, http_pwd=http_pwd,
+                                       host_header_rewrite=host_header_rewrite)
+                # 确保 vhost HTTPS 服务器已启动
+                self.server._ensure_vhost_https()
             else:
                 await self.send_msg(MSG_NEW_PROXY_RESP, {"name": name, "error": f"unsupported type: {proxy_type}"})
                 return
 
             self._proxies[name] = pxy
-            self.server._register_proxy(name, proxy_type, remote_port, self.run_id)
+            self.server._register_proxy(name, proxy_type, remote_port, self.run_id,
+                                         custom_domains=custom_domains, subdomain=subdomain)
 
-            remote_addr = f":{remote_port}" if remote_port else "(xtcp)"
+            if proxy_type in (PROXY_HTTP, PROXY_HTTPS):
+                remote_addr = f"vhost({', '.join(custom_domains)})"
+            elif proxy_type == PROXY_XTCP:
+                remote_addr = "(xtcp)"
+            else:
+                remote_addr = f":{remote_port}"
             await self.send_msg(MSG_NEW_PROXY_RESP, {
                 "name": name,
                 "remote_addr": remote_addr,
@@ -503,15 +1017,26 @@ class FrpServer:
     """frp-lite 服务端主控"""
 
     def __init__(self, bind_addr: str, bind_port: int, token: str,
-                 proxy_bind_addr: str = "0.0.0.0"):
+                 proxy_bind_addr: str = "0.0.0.0",
+                 vhost_http_port: int = 0, vhost_https_port: int = 0,
+                 cert_file: str = "", key_file: str = "",
+                 subdomain_host: str = ""):
         self.bind_addr = bind_addr
         self.bind_port = bind_port
         self.proxy_bind_addr = proxy_bind_addr
         self.token = token
+        self.vhost_http_port = vhost_http_port
+        self.vhost_https_port = vhost_https_port
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self.subdomain_host = subdomain_host
         self._server: Optional[asyncio.AbstractServer] = None
         self._controls: Dict[str, ControlHandler] = {}
         self._proxies: Dict[str, dict] = {}
         self._running = False
+        # vhost 服务器实例
+        self._vhost_http_server: Optional[VhostHTTPServer] = None
+        self._vhost_https_server: Optional[VhostHTTPSServer] = None
 
     async def start(self):
         """启动服务"""
@@ -528,6 +1053,17 @@ class FrpServer:
             addr = s.getsockname()
             addrs.append(f"{addr[0]}:{addr[1]}")
         log.info(f"监听地址: {', '.join(addrs)}")
+
+        # 启动 vhost HTTP 服务器
+        if self.vhost_http_port > 0:
+            self._ensure_vhost_http()
+
+        # 启动 vhost HTTPS 服务器
+        if self.vhost_https_port > 0:
+            self._ensure_vhost_https()
+
+        if self.subdomain_host:
+            log.info(f"子域名根: {self.subdomain_host}")
 
         asyncio.ensure_future(self._server.serve_forever())
 
@@ -568,13 +1104,51 @@ class FrpServer:
                 return ctl
         return None
 
-    def _register_proxy(self, name: str, proxy_type: str,
-                         remote_port: int, run_id: str):
+    def _register_proxy(self, name: str, proxy_type: str, remote_port: int,
+                         run_id: str, custom_domains: list = None, subdomain: str = ""):
         self._proxies[name] = {
             "type": proxy_type,
             "remote_port": remote_port,
             "run_id": run_id,
+            "custom_domains": custom_domains or [],
+            "subdomain": subdomain,
         }
+
+    def _find_vhost_proxy(self, proxy_type: str, host: str):
+        """查找匹配指定 Host 的 vhost 代理"""
+        if not host:
+            return None
+        host = host.lower()
+        if ":" in host:
+            host = host.split(":")[0]
+
+        for ctl in self._controls.values():
+            for name, pxy in ctl._proxies.items():
+                if isinstance(pxy, (HTTPVhostProxy, HTTPSVhostProxy)):
+                    if proxy_type == PROXY_HTTP and isinstance(pxy, HTTPVhostProxy):
+                        if pxy.match_host(host):
+                            return pxy
+                    elif proxy_type == PROXY_HTTPS and isinstance(pxy, HTTPSVhostProxy):
+                        if pxy.match_host(host):
+                            return pxy
+        return None
+
+    def _ensure_vhost_http(self):
+        """确保 vhost HTTP 服务器已启动"""
+        if self._vhost_http_server is None and self.vhost_http_port > 0:
+            self._vhost_http_server = VhostHTTPServer(
+                self.proxy_bind_addr, self.vhost_http_port, self
+            )
+            asyncio.ensure_future(self._vhost_http_server.start())
+
+    def _ensure_vhost_https(self):
+        """确保 vhost HTTPS 服务器已启动"""
+        if self._vhost_https_server is None and self.vhost_https_port > 0:
+            self._vhost_https_server = VhostHTTPSServer(
+                self.proxy_bind_addr, self.vhost_https_port, self,
+                cert_file=self.cert_file, key_file=self.key_file
+            )
+            asyncio.ensure_future(self._vhost_https_server.start())
 
     def _unregister_proxy(self, name: str):
         self._proxies.pop(name, None)
@@ -593,6 +1167,12 @@ class FrpServer:
                 ctl.writer.close()
             except Exception:
                 pass
+        if self._vhost_http_server:
+            await self._vhost_http_server.close()
+            self._vhost_http_server = None
+        if self._vhost_https_server:
+            await self._vhost_https_server.close()
+            self._vhost_https_server = None
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -639,6 +1219,11 @@ def main():
     parser.add_argument("--bind-port", type=int, default=7000, help="控制连接监听端口 (默认: 7000)")
     parser.add_argument("--token", default=None, help="认证 token (不指定则自动生成)")
     parser.add_argument("--proxy-bind-addr", default="0.0.0.0", help="代理端口绑定地址 (默认: 0.0.0.0)")
+    parser.add_argument("--vhost-http-port", type=int, default=0, help="HTTP vhost 监听端口 (默认: 0 不启用)")
+    parser.add_argument("--vhost-https-port", type=int, default=0, help="HTTPS vhost 监听端口 (默认: 0 不启用)")
+    parser.add_argument("--cert-file", default="", help="HTTPS 证书文件路径 (PEM 格式)")
+    parser.add_argument("--key-file", default="", help="HTTPS 私钥文件路径 (PEM 格式)")
+    parser.add_argument("--subdomain-host", default="", help="子域名根 (如: frp.example.com)")
 
     args = parser.parse_args()
 
@@ -651,6 +1236,11 @@ def main():
         bind_port=args.bind_port,
         token=token,
         proxy_bind_addr=args.proxy_bind_addr,
+        vhost_http_port=args.vhost_http_port,
+        vhost_https_port=args.vhost_https_port,
+        cert_file=args.cert_file,
+        key_file=args.key_file,
+        subdomain_host=args.subdomain_host,
     )
 
     loop = asyncio.new_event_loop()

@@ -33,6 +33,20 @@
       "local_ip": "127.0.0.1",
       "local_port": 3389,
       "secret_key": "shared_secret_123"
+    },
+    {
+      "name": "web_http",
+      "type": "http",
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "custom_domains": ["www.example.com", "example.com"]
+    },
+    {
+      "name": "web_https",
+      "type": "https",
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "custom_domains": ["secure.example.com"]
     }
   ],
   "visitors": [

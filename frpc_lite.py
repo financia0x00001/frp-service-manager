@@ -45,7 +45,7 @@ from frp_lite_protocol import (
     MSG_START_WORK_CONN, MSG_PING, MSG_PONG, MSG_UDP_PACKET,
     MSG_NAT_HOLE_VISITOR, MSG_NAT_HOLE_CLIENT,
     MSG_NAT_HOLE_RESP, MSG_NAT_HOLE_SID,
-    PROXY_TCP, PROXY_UDP, PROXY_XTCP,
+    PROXY_TCP, PROXY_UDP, PROXY_XTCP, PROXY_HTTP, PROXY_HTTPS,
     read_message, write_message, generate_run_id,
     generate_transaction_id, generate_sid,
 )
@@ -588,18 +588,31 @@ class ControlSession:
             await client.start()
         elif proxy_type == PROXY_XTCP:
             self._proxy_clients[name] = XTCPProxyClient(cfg, self)
+        elif proxy_type in (PROXY_HTTP, PROXY_HTTPS):
+            # HTTP/HTTPS 代理复用 TCPProxyClient（都是通过工作连接转发 TCP 流）
+            self._proxy_clients[name] = TCPProxyClient(cfg, self)
         else:
             log.error(f"不支持的代理类型: {proxy_type}")
             return
 
-        await self.send_msg(MSG_NEW_PROXY, {
+        # 构建注册消息，包含 vhost 相关字段
+        msg_data = {
             "name": name,
             "proxy_type": proxy_type,
             "remote_port": remote_port,
             "local_ip": cfg.get("local_ip", "127.0.0.1"),
             "local_port": cfg.get("local_port", 0),
             "secret_key": cfg.get("secret_key", ""),
-        })
+        }
+        # HTTP/HTTPS 代理需要额外字段
+        if proxy_type in (PROXY_HTTP, PROXY_HTTPS):
+            msg_data["custom_domains"] = cfg.get("custom_domains", [])
+            msg_data["subdomain"] = cfg.get("subdomain", "")
+            msg_data["http_user"] = cfg.get("http_user", "")
+            msg_data["http_pwd"] = cfg.get("http_pwd", "")
+            msg_data["host_header_rewrite"] = cfg.get("host_header_rewrite", "")
+
+        await self.send_msg(MSG_NEW_PROXY, msg_data)
         log.info(f"[REG] 注册代理: {name} ({proxy_type})")
 
     async def _register_visitor(self, cfg: dict):
@@ -881,6 +894,20 @@ def generate_example_config(path: str):
                 "local_ip": "127.0.0.1",
                 "local_port": 3389,
                 "secret_key": "shared_secret_123",
+            },
+            {
+                "name": "web_http",
+                "type": "http",
+                "local_ip": "127.0.0.1",
+                "local_port": 8080,
+                "custom_domains": ["www.example.com", "example.com"],
+            },
+            {
+                "name": "web_https",
+                "type": "https",
+                "local_ip": "127.0.0.1",
+                "local_port": 8080,
+                "custom_domains": ["secure.example.com"],
             },
         ],
         "visitors": [

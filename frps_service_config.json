@@ -1,5 +1,10 @@
 {
   "bind_addr": "0.0.0.0",
   "bind_port": "7000",
-  "token": ""
+  "token": "",
+  "vhost_http_port": 0,
+  "vhost_https_port": 0,
+  "cert_file": "",
+  "key_file": "",
+  "subdomain_host": ""
 }

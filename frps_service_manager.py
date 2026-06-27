@@ -91,8 +91,28 @@ class ServiceManagerGUI:
         token_entry = ttk.Entry(cfg_frame, textvariable=self.token_var, width=20)
         token_entry.grid(row=2, column=1, padx=10)
         ttk.Button(cfg_frame, text="随机生成", command=self._gen_token, width=10).grid(row=2, column=2, padx=5)
-        
-        ttk.Button(cfg_frame, text="💾 应用配置并重启服务", command=self._apply_config).grid(row=3, column=0, columnspan=3, pady=(10, 0))
+
+        ttk.Label(cfg_frame, text="HTTP端口:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.vhost_http_port_var = tk.StringVar(value="0")
+        ttk.Entry(cfg_frame, textvariable=self.vhost_http_port_var, width=20).grid(row=3, column=1, padx=10)
+
+        ttk.Label(cfg_frame, text="HTTPS端口:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.vhost_https_port_var = tk.StringVar(value="0")
+        ttk.Entry(cfg_frame, textvariable=self.vhost_https_port_var, width=20).grid(row=4, column=1, padx=10)
+
+        ttk.Label(cfg_frame, text="证书文件:").grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.cert_file_var = tk.StringVar(value="")
+        ttk.Entry(cfg_frame, textvariable=self.cert_file_var, width=20).grid(row=5, column=1, padx=10)
+
+        ttk.Label(cfg_frame, text="私钥文件:").grid(row=6, column=0, sticky=tk.W, pady=5)
+        self.key_file_var = tk.StringVar(value="")
+        ttk.Entry(cfg_frame, textvariable=self.key_file_var, width=20).grid(row=6, column=1, padx=10)
+
+        ttk.Label(cfg_frame, text="子域名根:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        self.subdomain_host_var = tk.StringVar(value="")
+        ttk.Entry(cfg_frame, textvariable=self.subdomain_host_var, width=20).grid(row=7, column=1, padx=10)
+
+        ttk.Button(cfg_frame, text="💾 应用配置并重启服务", command=self._apply_config).grid(row=8, column=0, columnspan=3, pady=(10, 0))
         
         # 说明面板
         info_frame = ttk.LabelFrame(self.root, text="使用说明", padding=12)
@@ -315,7 +335,12 @@ class ServiceManagerGUI:
         config = {
             "bind_addr": self.bind_addr_var.get(),
             "bind_port": self.bind_port_var.get(),
-            "token": self.token_var.get()
+            "token": self.token_var.get(),
+            "vhost_http_port": self.vhost_http_port_var.get(),
+            "vhost_https_port": self.vhost_https_port_var.get(),
+            "cert_file": self.cert_file_var.get(),
+            "key_file": self.key_file_var.get(),
+            "subdomain_host": self.subdomain_host_var.get(),
         }
         config_path = os.path.join(os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__), "frps_service_config.json")
         with open(config_path, 'w', encoding='utf-8') as f:
@@ -388,7 +413,12 @@ def _run_as_service():
         config = {
             "bind_addr": "0.0.0.0",
             "bind_port": 7000,
-            "token": ""
+            "token": "",
+            "vhost_http_port": 0,
+            "vhost_https_port": 0,
+            "cert_file": "",
+            "key_file": "",
+            "subdomain_host": "",
         }
         
         if os.path.exists(config_path):
@@ -409,12 +439,28 @@ def _run_as_service():
         bind_addr = config["bind_addr"]
         bind_port = int(config["bind_port"])
         token = config["token"] or generate_token()
-        
+        vhost_http_port = int(config.get("vhost_http_port", 0))
+        vhost_https_port = int(config.get("vhost_https_port", 0))
+        cert_file = config.get("cert_file", "")
+        key_file = config.get("key_file", "")
+        subdomain_host = config.get("subdomain_host", "")
+
         log.info(f"frp-lite 服务启动 -> {bind_addr}:{bind_port}")
         log.info(f"Token: {token}")
-        
+        if vhost_http_port:
+            log.info(f"HTTP vhost 端口: {vhost_http_port}")
+        if vhost_https_port:
+            log.info(f"HTTPS vhost 端口: {vhost_https_port}")
+        if subdomain_host:
+            log.info(f"子域名根: {subdomain_host}")
+
         # 启动服务器
-        server = FrpServer(bind_addr, bind_port, token)
+        server = FrpServer(bind_addr, bind_port, token,
+                            vhost_http_port=vhost_http_port,
+                            vhost_https_port=vhost_https_port,
+                            cert_file=cert_file,
+                            key_file=key_file,
+                            subdomain_host=subdomain_host)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
